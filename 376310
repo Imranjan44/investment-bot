@@ -1,0 +1,250 @@
+import os
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackQueryHandler,
+    CallbackContext,
+    MessageHandler,
+    Filters
+)
+from datetime import datetime, timedelta
+
+# توکن ربات از متغیر محیطی می‌خواند
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+
+# اتصال به دیتابیس SQLite
+conn = sqlite3.connect('investment_bot.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# ایجاد جداول اگر وجود نداشت
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    invest_plan_id INTEGER,
+    invest_amount REAL,
+    invest_start_date TEXT,
+    last_withdraw_date TEXT,
+    balance REAL DEFAULT 0,
+    total_profit REAL DEFAULT 0,
+    is_admin INTEGER DEFAULT 0
+)
+''')
+conn.commit()
+
+# تعریف طرح‌ها
+INVESTMENT_PLANS = [
+    {"id": 1, "name": "طرح ۱", "amount": 17, "daily": 1, "days": 50},
+    {"id": 2, "name": "طرح ۲", "amount": 50, "daily": 2, "days": 48},
+    {"id": 3, "name": "طرح ۳", "amount": 100, "daily": 3, "days": 64},
+    {"id": 4, "name": "طرح ۴", "amount": 180, "daily": 9, "days": 50}
+]
+
+# آدرس کیف پول USDT
+WALLET_ADDRESS = "0xYourWalletAddressHere"
+
+def is_admin(user_id):
+    cursor.execute('SELECT is_admin FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    return row and row[0] == 1
+
+def add_user(user):
+    cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user.id,))
+    if cursor.fetchone() is None:
+        cursor.execute('INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)',
+                       (user.id, user.username, user.first_name))
+        conn.commit()
+
+def start(update: Update, context: CallbackContext):
+    user = update.effective_user
+    add_user(user)
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 طرح‌های سرمایه‌گذاری", callback_data='plans')],
+        [InlineKeyboardButton("💰 کیف پول من", callback_data='wallet')],
+        [InlineKeyboardButton("💳 واریز وجه", callback_data='deposit')],
+        [InlineKeyboardButton("📤 درخواست برداشت", callback_data='withdraw')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.message.reply_text(
+        f"سلام {user.first_name} 👋\n"
+        "به ربات سرمایه‌گذاری خوش آمدید!\n"
+        "لطفا یکی از گزینه‌های زیر را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+def show_plans(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    
+    keyboard = []
+    for plan in INVESTMENT_PLANS:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{plan['name']}: سرمایه {plan['amount']}$ → سود روزانه {plan['daily']}$ برای {plan['days']} روز",
+                callback_data=f"plan_{plan['id']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data='back')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    query.edit_message_text(
+        text="📊 طرح‌های سرمایه‌گذاری موجود:",
+        reply_markup=reply_markup
+    )
+
+def show_deposit(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data='back')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(
+        text=f"💰 برای واریز وجه لطفا مبلغ مورد نظر را به آدرس زیر ارسال کنید:\n\n"
+             f"آدرس کیف پول: `{WALLET_ADDRESS}`\n\n"
+             f"⚠️ توجه: فقط ارز USDT (شبکه ERC20) قابل قبول است.\n"
+             f"پس از واریز، رسید تراکنش را برای پشتیبانی ارسال کنید.",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+def button_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    data = query.data
+    
+    if data == 'plans':
+        show_plans(update, context)
+    elif data == 'deposit':
+        show_deposit(update, context)
+    elif data == 'back':
+        start(update, context)
+    elif data.startswith('plan_'):
+        plan_id = int(data.split('_')[1])
+        show_plan_details(update, context, plan_id)
+    elif data.startswith('select_'):
+        plan_id = int(data.split('_')[1])
+        select_plan(update, context, plan_id)
+    elif data == 'wallet':
+        show_wallet(update, context)
+    elif data == 'withdraw':
+        request_withdraw(update, context)
+
+def show_plan_details(update: Update, context: CallbackContext, plan_id: int):
+    query = update.callback_query
+    plan = next(p for p in INVESTMENT_PLANS if p['id'] == plan_id)
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ انتخاب این طرح", callback_data=f'select_{plan_id}')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='plans')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(
+        text=f"📋 جزئیات طرح {plan['name']}:\n\n"
+             f"💵 مبلغ سرمایه‌گذاری: {plan['amount']} $\n"
+             f"💰 سود روزانه: {plan['daily']} $\n"
+             f"📅 مدت زمان: {plan['days']} روز\n"
+             f"💸 سود کل: {plan['daily'] * plan['days']} $\n\n"
+             f"برای انتخاب این طرح دکمه زیر را بزنید:",
+        reply_markup=reply_markup
+    )
+
+def select_plan(update: Update, context: CallbackContext, plan_id: int):
+    user_id = update.effective_user.id
+    plan = next(p for p in INVESTMENT_PLANS if p['id'] == plan_id)
+    
+    cursor.execute('''
+        UPDATE users
+        SET invest_plan_id = ?, invest_amount = ?, invest_start_date = ?
+        WHERE user_id = ?
+    ''', (plan_id, plan['amount'], datetime.now().strftime('%Y-%m-%d'), user_id))
+    conn.commit()
+    
+    update.callback_query.answer(text="طرح انتخاب شد! لطفا وجه را واریز کنید.")
+    update.callback_query.edit_message_text(
+        text=f"✅ شما طرح {plan['name']} را انتخاب کردید.\n"
+             f"مبلغ سرمایه‌گذاری: {plan['amount']} دلار\n"
+             f"لطفا مبلغ را به آدرس زیر واریز کنید:\n"
+             f"{WALLET_ADDRESS}"
+    )
+
+def show_wallet(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    cursor.execute('SELECT invest_plan_id, invest_amount, invest_start_date, balance, total_profit FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row is None or row[0] is None:
+        text = "شما هنوز هیچ طرحی انتخاب نکرده‌اید."
+    else:
+        plan = next(p for p in INVESTMENT_PLANS if p['id'] == row[0])
+        invest_date = datetime.strptime(row[2], '%Y-%m-%d')
+        days_passed = (datetime.now() - invest_date).days
+        days_passed = min(days_passed, plan['days'])
+        earned = days_passed * plan['daily']
+        text = (f"💼 اطلاعات سرمایه‌گذاری شما:\n\n"
+                f"طرح: {plan['name']}\n"
+                f"سرمایه اولیه: {row[1]} دلار\n"
+                f"تاریخ شروع: {row[2]}\n"
+                f"مدت گذشت: {days_passed} روز\n"
+                f"سود کسب شده: {earned} دلار\n"
+                f"مانده سود قابل برداشت: {row[3]} دلار\n"
+                f"کل سود پرداخت شده: {row[4]} دلار\n"
+               )
+    update.callback_query.answer()
+    update.callback_query.edit_message_text(text=text)
+
+def request_withdraw(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    cursor.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row is None or row[0] is None or row[0] <= 0:
+        update.callback_query.answer(text="شما هیچ سود قابل برداشت ندارید.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("ارسال درخواست برداشت", callback_data='confirm_withdraw')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='wallet')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.callback_query.answer()
+    update.callback_query.edit_message_text(
+        text=f"💰 شما {row[0]} دلار سود قابل برداشت دارید.\nآیا می‌خواهید درخواست برداشت ارسال کنید؟",
+        reply_markup=reply_markup
+    )
+
+def confirm_withdraw(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    cursor.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row is None or row[0] is None or row[0] <= 0:
+        update.callback_query.answer(text="سود قابل برداشت کافی نیست.")
+        return
+    
+    # اینجا باید درخواست برداشت را ذخیره و یا به ادمین اطلاع داد (کد نمونه ساده)
+    cursor.execute('UPDATE users SET balance = 0, total_profit = total_profit + ? WHERE user_id = ?', (row[0], user_id))
+    conn.commit()
+    
+    update.callback_query.answer(text="درخواست برداشت ثبت شد. در اسرع وقت بررسی می‌شود.")
+    update.callback_query.edit_message_text(text="✅ درخواست برداشت شما ثبت شد.")
+
+def main():
+    updater = Updater(TOKEN)
+    dispatcher = updater.dispatcher
+    
+    dispatcher.add_handler(CommandHandler('start', start))
+    dispatcher.add_handler(CallbackQueryHandler(button_handler))
+    
+    # افزودن هندلر برای تأیید برداشت
+    dispatcher.add_handler(CallbackQueryHandler(confirm_withdraw, pattern='confirm_withdraw'))
+    
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
